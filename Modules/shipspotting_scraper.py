@@ -2,12 +2,13 @@
 """
 shipspotting_scraper.py
 Enhanced hybrid module for scraping vessel images from ShipSpotting
-Uses cloudscraper for gallery pages and async for image downloads
+Uses cloudscraper for gallery pages and uploads directly to Google Cloud Storage
 """
 
 import re
 import time
 import json
+import yaml
 import asyncio
 import random
 import threading
@@ -22,30 +23,66 @@ import httpx
 import cloudscraper
 from bs4 import BeautifulSoup
 
+# Import GCS helper
+try:
+    from .gcs_helper import get_gcs_manager
+except ImportError:
+    from gcs_helper import get_gcs_manager
+
+# ====================== Load Configuration ======================
+def load_config():
+    """Load configuration from config.yaml"""
+    config_paths = [
+        Path("resources/config.yaml"),
+        Path("../resources/config.yaml"),
+        Path("./config.yaml"),
+    ]
+    
+    for path in config_paths:
+        if path.exists():
+            with open(path, 'r') as f:
+                return yaml.safe_load(f)
+    
+    # Fallback to defaults
+    return {
+        'scraping': {
+            'max_photos_per_imo': 40,
+            'max_gallery_pages': 10,
+            'batch_size': 10,
+            'connect_timeout': 8.0,
+            'read_timeout': 12.0,
+            'max_retries': 3,
+            'retry_backoff_base': 1.0,
+            'min_request_delay': 0.05,
+            'max_request_delay': 0.12,
+            'gallery_workers': 4,
+            'image_download_workers': 12,
+            'max_concurrent_downloads': 20,
+            'stream_chunk_size': 8192
+        }
+    }
+
+CONFIG = load_config()
+SCRAPING_CONFIG = CONFIG['scraping']
+
 # ====================== Configuration ======================
 BASE_URL = "https://www.shipspotting.com"
 PHOTO_URL = BASE_URL + "/photos/{pid}"
 
-# Performance settings - optimized for speed
-MAX_PHOTOS_PER_IMO = 40  # Reduced from 50 for faster completion
-MAX_GALLERY_PAGES = 10  # Max pages to check per sort
-BATCH_SIZE = 10  # IMOs to process simultaneously
-
-# Network settings
-CONNECT_TIMEOUT = 8.0
-READ_TIMEOUT = 12.0
-MAX_RETRIES = 3
-RETRY_BACKOFF_BASE = 1.0  # Exponential backoff base
-MIN_REQUEST_DELAY = 0.05  # 50ms minimum
-MAX_REQUEST_DELAY = 0.12  # 120ms maximum
-
-# Concurrency settings
-GALLERY_WORKERS = 4  # Concurrent gallery searchers
-IMAGE_DOWNLOAD_WORKERS = 12  # Concurrent image downloads
-MAX_CONCURRENT_DOWNLOADS = 20  # Global limit on concurrent downloads
-
-# Image download settings
-STREAM_CHUNK_SIZE = 8192  # 8KB chunks for streaming
+# Extract settings from config
+MAX_PHOTOS_PER_IMO = SCRAPING_CONFIG['max_photos_per_imo']
+MAX_GALLERY_PAGES = SCRAPING_CONFIG['max_gallery_pages']
+BATCH_SIZE = SCRAPING_CONFIG['batch_size']
+CONNECT_TIMEOUT = SCRAPING_CONFIG['connect_timeout']
+READ_TIMEOUT = SCRAPING_CONFIG['read_timeout']
+MAX_RETRIES = SCRAPING_CONFIG['max_retries']
+RETRY_BACKOFF_BASE = SCRAPING_CONFIG['retry_backoff_base']
+MIN_REQUEST_DELAY = SCRAPING_CONFIG['min_request_delay']
+MAX_REQUEST_DELAY = SCRAPING_CONFIG['max_request_delay']
+GALLERY_WORKERS = SCRAPING_CONFIG['gallery_workers']
+IMAGE_DOWNLOAD_WORKERS = SCRAPING_CONFIG['image_download_workers']
+MAX_CONCURRENT_DOWNLOADS = SCRAPING_CONFIG['max_concurrent_downloads']
+STREAM_CHUNK_SIZE = SCRAPING_CONFIG['stream_chunk_size']
 
 # Logging setup
 logging.basicConfig(
@@ -303,13 +340,14 @@ class PhotoFinder:
         
         return photo_list, total_photos
 
-# ====================== Async Image Downloader ======================
-class AsyncImageDownloader:
-    """Download images using async httpx with cloudscraper credentials"""
+# ====================== GCS Image Uploader ======================
+class GCSImageUploader:
+    """Download images and upload directly to Google Cloud Storage"""
     
     def __init__(self):
         self.cookies, self.headers = get_scraper_session().get_cookies_and_headers()
         self.semaphore = asyncio.Semaphore(MAX_CONCURRENT_DOWNLOADS)
+        self.gcs_manager = get_gcs_manager()
     
     def construct_image_url(self, photo_id: str) -> List[str]:
         """Construct possible image URLs"""
@@ -330,14 +368,9 @@ class AsyncImageDownloader:
         
         return urls
     
-    async def download_image_async(self, client: httpx.AsyncClient, photo_id: str, 
-                                  output_dir: Path) -> bool:
-        """Download a single image asynchronously"""
-        jpg_path = output_dir / f"{photo_id}.jpg"
-        
-        if jpg_path.exists():
-            return True
-        
+    async def download_and_upload_image(self, client: httpx.AsyncClient, 
+                                       imo: str, photo_id: str) -> bool:
+        """Download image and upload directly to GCS"""
         async with self.semaphore:
             # Add small random delay
             await asyncio.sleep(random.uniform(0.01, 0.05))
@@ -352,11 +385,7 @@ class AsyncImageDownloader:
                         if 'image' not in content_type.lower():
                             continue
                         
-                        # Save image
-                        jpg_path.write_bytes(response.content)
-                        
-                        # Save metadata
-                        json_path = output_dir / f"{photo_id}.json"
+                        # Prepare metadata
                         metadata = {
                             "photo_id": photo_id,
                             "image_url": img_url,
@@ -364,19 +393,24 @@ class AsyncImageDownloader:
                             "scraped_at": datetime.now().isoformat()
                         }
                         
-                        with open(json_path, 'w') as f:
-                            json.dump(metadata, f, indent=2)
+                        # Upload to GCS
+                        success = self.gcs_manager.upload_image(
+                            imo=imo,
+                            photo_id=photo_id,
+                            image_data=response.content,
+                            metadata=metadata
+                        )
                         
-                        return True
+                        return success
                         
                 except Exception as e:
-                    logger.debug(f"Failed to download {img_url}: {e}")
+                    logger.debug(f"Failed to download/upload {img_url}: {e}")
                     continue
             
             return False
     
-    async def download_batch(self, photo_ids: List[str], output_dir: Path) -> int:
-        """Download multiple images concurrently"""
+    async def upload_batch(self, imo: str, photo_ids: List[str]) -> int:
+        """Download and upload multiple images for an IMO"""
         async with httpx.AsyncClient(
             cookies=self.cookies,
             headers=self.headers,
@@ -384,40 +418,36 @@ class AsyncImageDownloader:
             limits=httpx.Limits(max_keepalive_connections=20, max_connections=40)
         ) as client:
             
-            # Create tasks for all downloads
+            # Create tasks for all downloads/uploads
             tasks = [
-                self.download_image_async(client, pid, output_dir) 
+                self.download_and_upload_image(client, imo, pid) 
                 for pid in photo_ids
             ]
             
             # Execute with progress tracking
-            downloaded = 0
+            uploaded = 0
             for i, coro in enumerate(asyncio.as_completed(tasks), 1):
                 result = await coro
                 if result:
-                    downloaded += 1
+                    uploaded += 1
                 
                 # Progress update
                 if i % 10 == 0 or i == len(tasks):
-                    logger.info(f"  Progress: {i}/{len(tasks)} images processed, {downloaded} downloaded")
+                    logger.info(f"  Progress: {i}/{len(tasks)} images processed, {uploaded} uploaded to GCS")
             
-            return downloaded
+            return uploaded
 
 # ====================== Main Scraper ======================
 class ShipSpottingScraper:
-    """Main scraper orchestrator"""
+    """Main scraper orchestrator with GCS integration"""
     
     def __init__(self):
         self.finder = PhotoFinder()
-        self.downloader = AsyncImageDownloader()
+        self.uploader = GCSImageUploader()
     
-    async def scrape_imo_async(self, imo: str, vessel_name: str, output_dir: Path) -> ScrapeResult:
-        """Scrape one IMO with async image downloads"""
+    async def scrape_imo_async(self, imo: str, vessel_name: str) -> ScrapeResult:
+        """Scrape one IMO and upload to GCS"""
         start_time = time.time()
-        
-        # Create IMO folder
-        imo_dir = output_dir / f"IMO_{imo}"
-        imo_dir.mkdir(parents=True, exist_ok=True)
         
         # Find photos (using threads)
         photo_ids, total_photos = self.finder.find_photos(imo)
@@ -432,37 +462,36 @@ class ShipSpottingScraper:
                 time_taken=time.time() - start_time
             )
         
-        logger.info(f"📥 Downloading {len(photo_ids)} images for {vessel_name[:30]}...")
+        logger.info(f"☁️  Uploading {len(photo_ids)} images to GCS for {vessel_name[:30]}...")
         
-        # Download images (using async)
-        downloaded = await self.downloader.download_batch(photo_ids, imo_dir)
+        # Download and upload images to GCS
+        uploaded = await self.uploader.upload_batch(imo, photo_ids)
         
         elapsed = time.time() - start_time
         
-        if downloaded > 0:
-            logger.info(f"✅ IMO {imo}: {downloaded}/{len(photo_ids)} images in {elapsed:.1f}s")
+        if uploaded > 0:
+            logger.info(f"✅ IMO {imo}: {uploaded}/{len(photo_ids)} images uploaded to GCS in {elapsed:.1f}s")
         else:
-            logger.warning(f"⚠️ IMO {imo}: No images downloaded")
+            logger.warning(f"⚠️ IMO {imo}: No images uploaded to GCS")
         
         return ScrapeResult(
             imo=imo,
             vessel_name=vessel_name,
-            downloaded=downloaded,
+            downloaded=uploaded,  # Now represents uploaded count
             found=len(photo_ids),
             total_available=total_photos,
             time_taken=elapsed
         )
     
-    def scrape_imo(self, imo: str, vessel_name: str, output_dir: Path) -> ScrapeResult:
+    def scrape_imo(self, imo: str, vessel_name: str) -> ScrapeResult:
         """Synchronous wrapper for compatibility"""
-        return asyncio.run(self.scrape_imo_async(imo, vessel_name, output_dir))
+        return asyncio.run(self.scrape_imo_async(imo, vessel_name))
 
 # ====================== Batch Processor ======================
 class BatchProcessor:
-    """Process multiple IMOs efficiently"""
+    """Process multiple IMOs efficiently with GCS upload"""
     
-    def __init__(self, output_dir: Path):
-        self.output_dir = output_dir
+    def __init__(self):
         self.stats = {
             'total_vessels': 0,
             'total_photos': 0,
@@ -477,7 +506,7 @@ class BatchProcessor:
         # Create tasks for each IMO
         tasks = []
         for imo, vessel_name in batch:
-            tasks.append(scraper.scrape_imo_async(imo, vessel_name, self.output_dir))
+            tasks.append(scraper.scrape_imo_async(imo, vessel_name))
         
         # Run all tasks concurrently
         results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -503,7 +532,8 @@ class BatchProcessor:
         
         start_time = time.time()
         
-        logger.info(f"\n🚀 Processing {len(imo_list)} IMOs with hybrid approach")
+        logger.info(f"\n🚀 Processing {len(imo_list)} IMOs with GCS upload")
+        logger.info(f"☁️  Target: Google Cloud Storage - {CONFIG['gcs']['bucket_name']}")
         logger.info(f"📸 Fetching up to {MAX_PHOTOS_PER_IMO} photos per vessel")
         logger.info(f"⚡ Gallery workers: {GALLERY_WORKERS}, Image downloads: {IMAGE_DOWNLOAD_WORKERS}")
         
@@ -511,6 +541,16 @@ class BatchProcessor:
         
         # Initialize the global scraper session once
         get_scraper_session()
+        
+        # Test GCS connection
+        try:
+            gcs = get_gcs_manager()
+            if not gcs.test_connection():
+                logger.error("Failed to connect to Google Cloud Storage")
+                return self.stats
+        except Exception as e:
+            logger.error(f"Failed to initialize GCS: {e}")
+            return self.stats
         
         all_results = []
         
@@ -542,9 +582,10 @@ class BatchProcessor:
         logger.info("📊 SCRAPING COMPLETE - SUMMARY")
         logger.info("="*60)
         logger.info(f"Total vessels processed: {self.stats['total_vessels']}")
-        logger.info(f"Total images downloaded: {self.stats['total_photos']}")
+        logger.info(f"Total images uploaded to GCS: {self.stats['total_photos']}")
         logger.info(f"Failed vessels: {self.stats['failed_vessels']}")
         logger.info(f"⏱️  Total time: {self.stats['total_time']:.1f}s")
+        logger.info(f"☁️  Storage: gs://{CONFIG['gcs']['bucket_name']}/{CONFIG['gcs']['paths']['upload_base']}")
         
         if all_results:
             avg_time = sum(r.time_taken for r in all_results) / len(all_results)
@@ -552,25 +593,27 @@ class BatchProcessor:
             
             if self.stats['total_photos'] > 0:
                 imgs_per_sec = self.stats['total_photos'] / self.stats['total_time']
-                logger.info(f"🚀 Download rate: {imgs_per_sec:.1f} images/second")
+                logger.info(f"🚀 Upload rate: {imgs_per_sec:.1f} images/second")
         
         return self.stats
 
 # ====================== Main Entry Point ======================
 def scrape_missing_imos(missing_imos: List[str], vessel_details: Dict[str, Dict], 
-                        gallery_dir: Path) -> Dict:
-    """Main function to scrape all missing IMOs"""
+                        gallery_dir: Path = None) -> Dict:
+    """Main function to scrape all missing IMOs and upload to GCS
+    
+    Note: gallery_dir parameter is kept for backward compatibility but ignored
+    """
     if not missing_imos:
         logger.info("✅ No IMOs to scrape - gallery is up to date!")
         return {'total_vessels': 0, 'total_photos': 0}
     
-    # Create output directory
-    output_dir = gallery_dir / datetime.now().strftime("%Y-%m-%d")
-    output_dir.mkdir(parents=True, exist_ok=True)
-    logger.info(f"📁 Output directory: {output_dir}")
+    # Log that we're using GCS
+    logger.info(f"☁️  Using Google Cloud Storage for uploads")
+    logger.info(f"📂 Upload path: gs://{CONFIG['gcs']['bucket_name']}/{CONFIG['gcs']['paths']['upload_base']}")
     
     # Process all IMOs
-    processor = BatchProcessor(output_dir)
+    processor = BatchProcessor()
     stats = processor.process_imos(missing_imos, vessel_details)
     
     return stats
@@ -578,7 +621,7 @@ def scrape_missing_imos(missing_imos: List[str], vessel_details: Dict[str, Dict]
 # ====================== Test Functions ======================
 if __name__ == "__main__":
     # Test the module
-    print("Testing Enhanced ShipSpotting Scraper...")
+    print("Testing Enhanced ShipSpotting Scraper with GCS...")
     
     test_imos = ["9169031", "9289972"]
     test_details = {
@@ -586,5 +629,5 @@ if __name__ == "__main__":
         "9289972": {"name": "Test Vessel 2"}
     }
     
-    stats = scrape_missing_imos(test_imos, test_details, Path("./test_output"))
+    stats = scrape_missing_imos(test_imos, test_details)
     print(f"\nTest complete: {stats}")

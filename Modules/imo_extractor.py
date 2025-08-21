@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 imo_extractor.py
-Extract IMO numbers (API or hardcoded) and check an existing gallery.
+Extract IMO numbers (API or hardcoded) and check existing gallery in GCS.
 
 Modes:
   - API mode:       Live Datalastic calls (uses credits)
@@ -16,6 +16,7 @@ import os
 import re
 import time
 import json
+import yaml
 import argparse
 import logging
 from pathlib import Path
@@ -23,6 +24,12 @@ from typing import List, Dict, Set, Tuple, Optional
 from datetime import datetime
 
 import requests
+
+# Import GCS helper
+try:
+    from .gcs_helper import get_gcs_manager
+except ImportError:
+    from gcs_helper import get_gcs_manager
 
 # ====================== Logging ======================
 logging.basicConfig(
@@ -32,11 +39,38 @@ logging.basicConfig(
 )
 log = logging.getLogger("IMOExtractor")
 
-# ====================== Configuration ======================
-API_KEY = "b123dc58-4c18-4b0c-9f04-82a06be63ff9"  # ⚠️ keep this out of VCS if possible
-SEARCH_RADIUS = 15  # km
-PORT_LAT = 32.8154
-PORT_LON = 35.0043
+# ====================== Load Configuration ======================
+def load_config():
+    """Load configuration from config.yaml"""
+    config_paths = [
+        Path("resources/config.yaml"),
+        Path("../resources/config.yaml"),
+        Path("./config.yaml"),
+    ]
+    
+    for path in config_paths:
+        if path.exists():
+            with open(path, 'r') as f:
+                return yaml.safe_load(f)
+    
+    # Fallback to defaults if config not found
+    log.warning("Config file not found, using defaults")
+    return {
+        'api': {'datalastic_key': 'b123dc58-4c18-4b0c-9f04-82a06be63ff9'},
+        'port': {
+            'latitude': 32.8154,
+            'longitude': 35.0043,
+            'search_radius_km': 15
+        }
+    }
+
+CONFIG = load_config()
+
+# Extract configuration values
+API_KEY = CONFIG['api']['datalastic_key']
+SEARCH_RADIUS = CONFIG['port']['search_radius_km']
+PORT_LAT = CONFIG['port']['latitude']
+PORT_LON = CONFIG['port']['longitude']
 
 # 5 sample IMOs for hardcoded testing (valid 7-digit format; arbitrary values)
 HARD_CODED_IMOS: List[str] = [
@@ -111,38 +145,17 @@ class HaifaBayTracker:
         unique_imos = sorted(set(imo_list))
         return unique_imos, vessel_details
 
-# ====================== Gallery Checker ======================
-class GalleryChecker:
-    def __init__(self, gallery_base_dir: Path):
-        self.gallery_base_dir = gallery_base_dir
-        self.alternative_paths = [
-            Path(r"C:\Users\OrGil.AzureAD\OneDrive - AMPC\Desktop\datasets"),
-            Path(r"C:\Users\OrGil.AzureAD\OneDrive - AMPC\Desktop\Azimut.ai\webScrape\webScrapeByIMO\recognition dataset"),
-        ]
-
+# ====================== Gallery Checker (GCS) ======================
+class GCSGalleryChecker:
+    def __init__(self):
+        """Initialize GCS gallery checker"""
+        self.gcs_manager = get_gcs_manager()
+        
     def check_existing_imos(self) -> Set[str]:
-        """Check all directories for existing IMOs."""
-        all_existing = set()
-        all_existing.update(self._check_directory(self.gallery_base_dir))
-        for p in self.alternative_paths:
-            if p.exists():
-                all_existing.update(self._check_directory(p))
-        return all_existing
-
-    def _check_directory(self, directory: Path) -> Set[str]:
-        existing_imos = set()
-        if not directory.exists():
-            return existing_imos
-
-        imo_pattern = re.compile(r"(?:IMO[_\-\s]*)(\d{7})", re.I)
-
-        for item in directory.rglob("*"):
-            if item.is_dir():
-                match = imo_pattern.search(item.name)
-                if match:
-                    existing_imos.add(match.group(1))
-                elif re.fullmatch(r"\d{7}", item.name):
-                    existing_imos.add(item.name)
+        """Check GCS for existing IMOs"""
+        log.info("🔍 Checking existing IMOs in Google Cloud Storage...")
+        existing_imos = self.gcs_manager.check_existing_imos()
+        log.info(f"📂 Found {len(existing_imos)} IMOs in GCS gallery")
         return existing_imos
 
 # ====================== Mode Selection ======================
@@ -204,17 +217,25 @@ def extract_haifa_imos(mode: Optional[str] = None) -> Tuple[List[str], Dict[str,
     log.info("✅ Found %d vessels with valid IMO numbers (API).", len(imo_list))
     return imo_list, vessel_details
 
-def find_missing_imos(gallery_dir: Path, haifa_imos: List[str]) -> Tuple[List[str], List[str]]:
-    log.info("🔍 Checking existing gallery in: %s", gallery_dir)
-    checker = GalleryChecker(gallery_dir)
+def find_missing_imos(haifa_imos: List[str]) -> Tuple[List[str], List[str]]:
+    """Find missing IMOs by checking GCS instead of local gallery"""
+    log.info("🔍 Checking existing gallery in Google Cloud Storage...")
+    
+    # Use GCS checker instead of local
+    checker = GCSGalleryChecker()
     existing_imos = checker.check_existing_imos()
-    log.info("📂 Found %d IMOs in gallery (all paths).", len(existing_imos))
-
+    
     missing_imos = [imo for imo in haifa_imos if imo not in existing_imos]
     existing_in_gallery = [imo for imo in haifa_imos if imo in existing_imos]
 
     log.info("🆕 %d new IMOs to scrape | ✅ %d already in gallery.", len(missing_imos), len(existing_in_gallery))
     return missing_imos, existing_in_gallery
+
+# For backward compatibility - keep the old signature but ignore gallery_dir
+def find_missing_imos_legacy(gallery_dir: Path, haifa_imos: List[str]) -> Tuple[List[str], List[str]]:
+    """Legacy function signature for backward compatibility"""
+    log.info("Note: Local gallery_dir parameter is ignored - using GCS instead")
+    return find_missing_imos(haifa_imos)
 
 # ====================== Summary Printer ======================
 def print_final_summary(
@@ -234,7 +255,7 @@ def print_final_summary(
     print(f"  • Run Date: {datetime.now().date()}")
     if mode == "api":
         print(f"  • Mode: API (live)")
-        print(f"  • Location: Haifa Bay ({radius_km}km radius)")
+        print(f"  • Location: {CONFIG['port']['name']} ({radius_km}km radius)")
         print(f"  • Total vessels in area: {total}")
     else:
         print(f"  • Mode: HARDCODED (no API)")
@@ -246,14 +267,17 @@ def print_final_summary(
     print(f"  • Total execution time: {total_time_s:.1f} seconds")
     print(f"  • IMO extraction: {extract_time_s:.1f} seconds")
     print(f"  • Gallery check: {gallery_time_s:.1f} seconds")
+    print("\n📂 Storage: Google Cloud Storage")
+    print(f"  • Bucket: {CONFIG['gcs']['bucket_name']}")
+    print(f"  • Check path: {CONFIG['gcs']['paths']['check_base']}")
 
 # ====================== CLI ======================
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Extract IMOs via API or hardcoded list; check gallery.")
+    p = argparse.ArgumentParser(description="Extract IMOs via API or hardcoded list; check GCS gallery.")
     p.add_argument("--mode", choices=["api", "hardcoded"], default=None,
                    help="Data source mode (CLI overrides ENV; if omitted, you'll be prompted).")
     p.add_argument("--gallery-dir", type=Path, default=Path.cwd(),
-                   help="Base gallery directory to scan for existing IMOs (default: current dir).")
+                   help="DEPRECATED - Now using GCS. This parameter is ignored.")
     return p.parse_args()
 
 # ====================== Main ======================
@@ -262,17 +286,27 @@ if __name__ == "__main__":
 
     t0 = time.perf_counter()
 
+    # Test GCS connection first
+    try:
+        gcs = get_gcs_manager()
+        if not gcs.test_connection():
+            log.error("Failed to connect to Google Cloud Storage")
+            exit(1)
+    except Exception as e:
+        log.error(f"Failed to initialize GCS: {e}")
+        exit(1)
+
     # Resolve mode with CLI/ENV/interactive (shown in logs)
     mode = resolve_mode(args.mode)
     log.info("🚀 Starting run (mode: %s)", mode.upper())
 
     t1 = time.perf_counter()
-    # Backward-compatible call works even if you import and do extract_haifa_imos()
-    # (it will resolve mode again, but that's fine). Here we pass the resolved mode explicitly.
+    # Extract IMOs
     imos, details = extract_haifa_imos(mode)
     t2 = time.perf_counter()
 
-    missing, existing = find_missing_imos(args.gallery_dir, imos)
+    # Check GCS for existing IMOs
+    missing, existing = find_missing_imos(imos)
     t3 = time.perf_counter()
 
     # Final printed summary (mode-aware)

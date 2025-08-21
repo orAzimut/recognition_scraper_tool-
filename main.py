@@ -2,28 +2,44 @@
 """
 main.py
 Automated orchestrator for IMO extraction and ShipSpotting scraping
-Runs the complete workflow automatically
+Now uses Google Cloud Storage instead of local filesystem
 """
 
 import time
 import sys
+import yaml
 from pathlib import Path
 from datetime import datetime
 import json
 from typing import Dict
 
-
-# Import the two modules
+# Import the modules
 try:
     from Modules.imo_extractor import extract_haifa_imos, find_missing_imos
     from Modules.shipspotting_scraper import scrape_missing_imos
+    from Modules.gcs_helper import get_gcs_manager
 except ImportError as e:
     print(f"❌ Error importing modules: {e}")
-    print("   Make sure 'imo_extractor.py' and 'shipspotting_scraper.py' are in the same directory")
+    print("   Make sure all modules are in the Modules directory")
     sys.exit(1)
 
-# ====================== Configuration ======================
-GALLERY_BASE_DIR = Path(r"C:\Users\OrGil.AzureAD\OneDrive - AMPC\Desktop\Azimut.ai\recognition_gallery")
+# ====================== Load Configuration ======================
+def load_config():
+    """Load configuration from config.yaml"""
+    config_paths = [
+        Path("resources/config.yaml"),
+        Path("./config.yaml"),
+    ]
+    
+    for path in config_paths:
+        if path.exists():
+            with open(path, 'r') as f:
+                return yaml.safe_load(f)
+    
+    print("❌ Config file not found in resources/config.yaml")
+    sys.exit(1)
+
+CONFIG = load_config()
 
 # Logging configuration
 LOG_FILE = Path(f"scraping_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json")
@@ -56,13 +72,13 @@ def display_summary(log_data: Dict):
     # Basic stats
     print(f"\n📊 Statistics:")
     print(f"  • Run Date: {log_data['run_date']}")
-    print(f"  • Location: Haifa Bay ({log_data['search_radius']}km radius)")
+    print(f"  • Location: {CONFIG['port']['name']} ({log_data['search_radius']}km radius)")
     print(f"  • Total vessels in area: {log_data['total_haifa_vessels']}")
     print(f"  • Already in gallery: {log_data['existing_vessels']}")
     print(f"  • New vessels scraped: {log_data['new_vessels_scraped']}")
     
     if log_data['new_vessels_scraped'] > 0:
-        print(f"  • Photos downloaded: {log_data['photos_downloaded']}")
+        print(f"  • Photos uploaded to GCS: {log_data['photos_downloaded']}")
         avg_photos = log_data['photos_downloaded'] / log_data['new_vessels_scraped']
         print(f"  • Average photos/vessel: {avg_photos:.1f}")
     
@@ -76,13 +92,29 @@ def display_summary(log_data: Dict):
         avg_time = log_data['scraping_time'] / log_data['new_vessels_scraped']
         print(f"  • Average time/vessel: {avg_time:.1f} seconds")
     
-    # Output location
-    print(f"\n📁 Output:")
-    print(f"  • Gallery path: {GALLERY_BASE_DIR}")
+    # Storage location
+    print(f"\n☁️  Storage:")
+    print(f"  • Bucket: gs://{CONFIG['gcs']['bucket_name']}")
+    print(f"  • Upload path: {CONFIG['gcs']['paths']['upload_base']}")
     print(f"  • Today's folder: {log_data['output_folder']}")
     print(f"  • Log file: {LOG_FILE}")
     
     print("\n" + "=" * 70)
+
+def test_gcs_connection() -> bool:
+    """Test Google Cloud Storage connection"""
+    try:
+        print("\n🔍 Testing Google Cloud Storage connection...")
+        gcs = get_gcs_manager()
+        if gcs.test_connection():
+            print(f"✅ Successfully connected to GCS bucket: {CONFIG['gcs']['bucket_name']}")
+            return True
+        else:
+            print(f"❌ Failed to connect to GCS bucket: {CONFIG['gcs']['bucket_name']}")
+            return False
+    except Exception as e:
+        print(f"❌ GCS connection error: {e}")
+        return False
 
 # ====================== Main Execution Function ======================
 def main():
@@ -93,21 +125,37 @@ def main():
     log_data = {
         'run_date': datetime.now().strftime('%Y-%m-%d'),
         'run_time': datetime.now().strftime('%H:%M:%S'),
-        'search_radius': 15,
-        'gallery_path': str(GALLERY_BASE_DIR),
+        'search_radius': CONFIG['port']['search_radius_km'],
+        'gcs_bucket': CONFIG['gcs']['bucket_name'],
+        'gcs_upload_path': CONFIG['gcs']['paths']['upload_base'],
         'output_folder': datetime.now().strftime('%Y-%m-%d')
     }
     
     # Welcome message
-    print_header("HAIFA BAY VESSEL IMAGE SCRAPER", "═", 70)
+    print_header("HAIFA BAY VESSEL IMAGE SCRAPER (GCS)", "═", 70)
     print(f"\n🕐 Started at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    print(f"📁 Gallery: {GALLERY_BASE_DIR}")
+    print(f"☁️  Storage: Google Cloud Storage")
+    print(f"📦 Bucket: gs://{CONFIG['gcs']['bucket_name']}")
+    print(f"📂 Upload path: {CONFIG['gcs']['paths']['upload_base']}")
     
     try:
+        # Test GCS connection first
+        if not test_gcs_connection():
+            print("\n❌ Cannot proceed without GCS connection")
+            print("   Please check:")
+            print(f"   1. Credentials file exists: {CONFIG['gcs']['credentials_path']}")
+            print(f"   2. Bucket is accessible: {CONFIG['gcs']['bucket_name']}")
+            print("   3. You have proper permissions")
+            log_data['status'] = 'failed'
+            log_data['error'] = 'GCS connection failed'
+            save_log(log_data)
+            return
+        
         # ============ STEP 1: Extract IMOs from Haifa Bay ============
         print_header("STEP 1: EXTRACTING IMOS FROM HAIFA BAY", "-", 70)
         extraction_start = time.time()
         
+        # Note: extract_haifa_imos will prompt for mode if not specified
         haifa_imos, vessel_details = extract_haifa_imos()
         
         log_data['extraction_time'] = time.time() - extraction_start
@@ -129,10 +177,10 @@ def main():
             print(f"  ... and {len(haifa_imos) - 5} more vessels")
         
         # ============ STEP 2: Find Missing IMOs ============
-        print_header("STEP 2: CHECKING GALLERY FOR EXISTING IMOS", "-", 70)
+        print_header("STEP 2: CHECKING GCS FOR EXISTING IMOS", "-", 70)
         gallery_check_start = time.time()
         
-        missing_imos, existing_imos = find_missing_imos(GALLERY_BASE_DIR, haifa_imos)
+        missing_imos, existing_imos = find_missing_imos(haifa_imos)
         
         log_data['gallery_check_time'] = time.time() - gallery_check_start
         log_data['existing_vessels'] = len(existing_imos)
@@ -158,7 +206,7 @@ def main():
             print(f"  ... and {len(missing_imos) - 10} more vessels")
         
         # ============ STEP 3: Scrape Missing IMOs ============
-        print_header("STEP 3: SCRAPING IMAGES FROM SHIPSPOTTING", "-", 70)
+        print_header("STEP 3: SCRAPING & UPLOADING TO GCS", "-", 70)
         scraping_start = time.time()
         
         # Ask for confirmation if many vessels
@@ -172,12 +220,12 @@ def main():
                 save_log(log_data)
                 return
         
-        # Scrape the missing IMOs
-        stats = scrape_missing_imos(missing_imos, vessel_details, GALLERY_BASE_DIR)
+        # Scrape the missing IMOs (uploads directly to GCS)
+        stats = scrape_missing_imos(missing_imos, vessel_details)
         
         log_data['scraping_time'] = time.time() - scraping_start
         log_data['new_vessels_scraped'] = stats.get('total_vessels', 0) - stats.get('failed_vessels', 0)
-        log_data['photos_downloaded'] = stats.get('total_photos', 0)
+        log_data['photos_downloaded'] = stats.get('total_photos', 0)  # Actually uploaded to GCS
         log_data['failed_vessels'] = stats.get('failed_vessels', 0)
         
         # ============ COMPLETION ============
@@ -192,9 +240,10 @@ def main():
         
         # Success message
         if log_data['photos_downloaded'] > 0:
-            print("\n🎉 SUCCESS! Gallery has been updated with new vessel images.")
+            print("\n🎉 SUCCESS! Images have been uploaded to Google Cloud Storage.")
+            print(f"☁️  Location: gs://{CONFIG['gcs']['bucket_name']}/{CONFIG['gcs']['paths']['upload_base']}/{datetime.now().strftime('%Y-%m-%d')}/")
         else:
-            print("\n⚠️  Completed, but no photos were downloaded.")
+            print("\n⚠️  Completed, but no photos were uploaded.")
             print("   This might be due to vessels not having photos on ShipSpotting.")
         
     except KeyboardInterrupt:
@@ -216,9 +265,7 @@ def main():
 # ====================== Entry Point ======================
 if __name__ == "__main__":
     try:
-     
         main()
-        
     except Exception as e:
         print(f"\n❌ Fatal error: {e}")
         sys.exit(1)

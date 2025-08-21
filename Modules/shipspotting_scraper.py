@@ -227,21 +227,28 @@ class PhotoFinder:
         return photo_ids
     
     def get_photo_count(self, html: str) -> int:
-        """Extract total photo count from gallery page"""
+        """Extract total photo count from gallery page - FIXED VERSION"""
+        soup = BeautifulSoup(html, "lxml")
+        text = soup.get_text()
+        
+        # These patterns work on ShipSpotting
         patterns = [
-            re.compile(r"(\d+)\s+photos?\s+found", re.I),
+            re.compile(r"(\d+)\s+photos?\s+found", re.I),  # "36 photos found"
             re.compile(r"found\s+(\d+)\s+photo", re.I),
+            re.compile(r"(\d+)\s+results?\s+found", re.I),
         ]
         
         for pattern in patterns:
-            match = pattern.search(html)
+            match = pattern.search(text)
             if match:
-                return int(match.group(1))
+                count = int(match.group(1))
+                return count
+        
         return -1
     
     def search_gallery_pages_parallel(self, imo: str, sort_by: str, 
                                     max_pages: int, target_count: int) -> Tuple[Set[str], int]:
-        """Search gallery pages using thread pool for parallelism"""
+        """Search gallery pages using thread pool for parallelism - FIXED VERSION"""
         all_photo_ids = set()
         total_photos = -1
         
@@ -257,50 +264,71 @@ class PhotoFinder:
         page1_ids = self.extract_photo_ids(html)
         all_photo_ids.update(page1_ids)
         
-        if total_photos <= 0 or not page1_ids:
-            return all_photo_ids, total_photos
+        # Log the detected count
+        if total_photos > 0:
+            logger.info(f"📊 Found {total_photos} total photos for IMO {imo}")
         
-        # Calculate how many pages we need
-        photos_per_page = len(page1_ids)
-        if photos_per_page == 0:
-            return all_photo_ids, total_photos
-        
-        pages_needed = min(
-            max_pages,
-            (min(target_count, total_photos) + photos_per_page - 1) // photos_per_page
-        )
+        # CRITICAL FIX: Always fetch multiple pages if we got a full first page
+        if len(page1_ids) >= 12:  # ShipSpotting shows 12 per page
+            if total_photos <= 0:
+                # Can't detect total, but got full page - assume at least 5 pages worth
+                logger.info(f"Got {len(page1_ids)} photos on page 1, assuming more pages exist")
+                estimated_pages = min(max_pages, 5)
+            else:
+                # We know the total, calculate pages needed
+                photos_per_page = 12  # ShipSpotting standard
+                photos_to_fetch = min(target_count, total_photos)
+                estimated_pages = min(
+                    max_pages,
+                    (photos_to_fetch + photos_per_page - 1) // photos_per_page
+                )
+            
+            pages_needed = estimated_pages
+        else:
+            # Less than 12 photos on first page means that's all there is
+            pages_needed = 1
         
         if pages_needed <= 1:
-            return all_photo_ids, total_photos
+            return all_photo_ids, total_photos if total_photos > 0 else len(all_photo_ids)
         
-        # Fetch remaining pages in parallel using threads
+        logger.info(f"📄 Will fetch {pages_needed} pages to get photos")
+        
+        # Fetch remaining pages in parallel using threads - FAST!
         def fetch_page(page_num):
             url = self.get_gallery_url(imo, sort_by, page_num)
             response = self.session.get(url)
             if response and response.status_code == 200:
-                return self.extract_photo_ids(response.text)
+                ids = self.extract_photo_ids(response.text)
+                if len(ids) > 0:
+                    logger.debug(f"Page {page_num}: found {len(ids)} photos")
+                return ids
             return set()
         
-        with ThreadPoolExecutor(max_workers=min(4, pages_needed - 1)) as executor:
+        with ThreadPoolExecutor(max_workers=min(GALLERY_WORKERS, pages_needed - 1)) as executor:
             futures = [executor.submit(fetch_page, page) for page in range(2, pages_needed + 1)]
             
             for future in futures:
                 page_ids = future.result()
                 all_photo_ids.update(page_ids)
                 
+                # Stop if we have enough
                 if len(all_photo_ids) >= target_count:
                     break
         
-        return all_photo_ids, total_photos
+        # If we still don't have the expected amount and total was detected, log it
+        if total_photos > 0 and len(all_photo_ids) < total_photos:
+            logger.debug(f"Found {len(all_photo_ids)} photo IDs but page shows {total_photos} total")
+        
+        return all_photo_ids, total_photos if total_photos > 0 else len(all_photo_ids)
     
     def find_photos(self, imo: str) -> Tuple[List[str], int]:
-        """Find all photo IDs for an IMO"""
+        """Find all photo IDs for an IMO - MAIN FUNCTION"""
         all_photo_ids = set()
         total_photos = -1
         
         logger.info(f"🔍 Searching for IMO {imo}...")
         
-        # Primary search: newest photos
+        # Primary search: newest photos - this usually gets everything
         photo_ids, total_photos = self.search_gallery_pages_parallel(
             imo, "newest", MAX_GALLERY_PAGES, MAX_PHOTOS_PER_IMO
         )
@@ -310,35 +338,37 @@ class PhotoFinder:
             logger.info(f"No photos found for IMO {imo}")
             return [], 0
         
-        if total_photos > 0:
-            logger.info(f"📊 Found {total_photos} total photos for IMO {imo}")
-        
-        # Stop early if we have enough
-        if len(all_photo_ids) >= min(MAX_PHOTOS_PER_IMO, total_photos):
-            photo_list = list(all_photo_ids)[:MAX_PHOTOS_PER_IMO]
-            logger.info(f"📷 Collected {len(photo_list)} photo IDs for IMO {imo}")
-            return photo_list, total_photos
-        
-        # Try other sort orders only if needed
-        remaining_needed = min(MAX_PHOTOS_PER_IMO, total_photos) - len(all_photo_ids)
-        
-        if remaining_needed > 0:
+        # Check if we got everything we expected
+        if total_photos > 0 and len(all_photo_ids) < min(total_photos, MAX_PHOTOS_PER_IMO):
+            # We're missing some photos, try other sort orders
+            missing_count = min(total_photos, MAX_PHOTOS_PER_IMO) - len(all_photo_ids)
+            logger.info(f"📝 Missing {missing_count} photos, trying other sort orders...")
+            
             for sort_order in ['oldest', 'popular']:
-                photo_ids, _ = self.search_gallery_pages_parallel(
-                    imo, sort_order, 2, remaining_needed
+                # Just fetch a couple pages of each sort to find unique photos
+                extra_ids, _ = self.search_gallery_pages_parallel(
+                    imo, sort_order, 3, missing_count
                 )
                 
-                new_ids = photo_ids - all_photo_ids
+                new_ids = extra_ids - all_photo_ids
                 if new_ids:
+                    logger.debug(f"Sort '{sort_order}' found {len(new_ids)} new photos")
                     all_photo_ids.update(new_ids)
                     
-                    if len(all_photo_ids) >= min(MAX_PHOTOS_PER_IMO, total_photos):
+                    # Stop if we have enough
+                    if len(all_photo_ids) >= min(total_photos, MAX_PHOTOS_PER_IMO):
                         break
         
+        # Prepare final list
         photo_list = list(all_photo_ids)[:MAX_PHOTOS_PER_IMO]
-        logger.info(f"📷 Collected {len(photo_list)} photo IDs for IMO {imo}")
         
-        return photo_list, total_photos
+        # Final log
+        if total_photos > 0:
+            logger.info(f"📷 Collected {len(photo_list)}/{total_photos} photo IDs for IMO {imo}")
+        else:
+            logger.info(f"📷 Collected {len(photo_list)} photo IDs for IMO {imo}")
+        
+        return photo_list, total_photos if total_photos > 0 else len(photo_list)
 
 # ====================== GCS Image Uploader ======================
 class GCSImageUploader:
@@ -586,6 +616,7 @@ class BatchProcessor:
         logger.info(f"Failed vessels: {self.stats['failed_vessels']}")
         logger.info(f"⏱️  Total time: {self.stats['total_time']:.1f}s")
         logger.info(f"☁️  Storage: gs://{CONFIG['gcs']['bucket_name']}/{CONFIG['gcs']['paths']['upload_base']}")
+    
         
         if all_results:
             avg_time = sum(r.time_taken for r in all_results) / len(all_results)

@@ -26,7 +26,7 @@ port:
 
 # Scraping Configuration
 scraping:
-  max_photos_per_imo: 40
+  max_photos_per_imo: 150
   max_gallery_pages: 10
   batch_size: 10
   

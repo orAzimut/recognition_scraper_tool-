@@ -2,7 +2,7 @@
 """
 main.py
 Automated orchestrator for IMO extraction and ShipSpotting scraping
-Now uses Google Cloud Storage instead of local filesystem
+Now uses Google Cloud Storage with JSON-based IMO gallery tracking
 """
 
 import time
@@ -95,8 +95,9 @@ def display_summary(log_data: Dict):
     # Storage location
     print(f"\n☁️  Storage:")
     print(f"  • Bucket: gs://{CONFIG['gcs']['bucket_name']}")
-    print(f"  • Upload path: {CONFIG['gcs']['paths']['upload_base']}")
-    print(f"  • Today's folder: {log_data['output_folder']}")
+    print(f"  • Photos path: reidentification/bronze/raw_crops/ship_spotting/IMO_*/")
+    print(f"  • JSON metadata path: reidentification/bronze/json_lables/ship_spotting/IMO_*/")
+    print(f"  • IMO gallery index: reidentification/bronze/json_lables/ship_spotting/imo_galley.json")
     print(f"  • Log file: {LOG_FILE}")
     
     print("\n" + "=" * 70)
@@ -127,8 +128,8 @@ def main():
         'run_time': datetime.now().strftime('%H:%M:%S'),
         'search_radius': CONFIG['port']['search_radius_km'],
         'gcs_bucket': CONFIG['gcs']['bucket_name'],
-        'gcs_upload_path': CONFIG['gcs']['paths']['upload_base'],
-        'output_folder': datetime.now().strftime('%Y-%m-%d')
+        'gcs_upload_path': 'reidentification/bronze/raw_crops/ship_spotting',
+        'output_folder': 'N/A - Direct upload without timestamp folders'
     }
     
     # Welcome message
@@ -136,7 +137,9 @@ def main():
     print(f"\n🕐 Started at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"☁️  Storage: Google Cloud Storage")
     print(f"📦 Bucket: gs://{CONFIG['gcs']['bucket_name']}")
-    print(f"📂 Upload path: {CONFIG['gcs']['paths']['upload_base']}")
+    print(f"📸 Photos path: reidentification/bronze/raw_crops/ship_spotting/")
+    print(f"📄 JSON metadata: reidentification/bronze/json_lables/ship_spotting/")
+    print(f"📋 IMO Gallery index: reidentification/bronze/json_lables/ship_spotting/imo_galley.json")
     
     try:
         # Test GCS connection first
@@ -150,6 +153,9 @@ def main():
             log_data['error'] = 'GCS connection failed'
             save_log(log_data)
             return
+        
+        # Get GCS manager instance
+        gcs = get_gcs_manager()
         
         # ============ STEP 1: Extract IMOs from Haifa Bay ============
         print_header("STEP 1: EXTRACTING IMOS FROM HAIFA BAY", "-", 70)
@@ -178,6 +184,7 @@ def main():
         
         # ============ STEP 2: Find Missing IMOs ============
         print_header("STEP 2: CHECKING GCS FOR EXISTING IMOS", "-", 70)
+        print("📄 Using JSON gallery for fast lookup...")
         gallery_check_start = time.time()
         
         missing_imos, existing_imos = find_missing_imos(haifa_imos)
@@ -185,6 +192,8 @@ def main():
         log_data['gallery_check_time'] = time.time() - gallery_check_start
         log_data['existing_vessels'] = len(existing_imos)
         log_data['new_vessels_to_scrape'] = len(missing_imos)
+        
+        print(f"⚡ Gallery check completed in {log_data['gallery_check_time']:.2f} seconds")
         
         if not missing_imos:
             print("\n🎉 Gallery is up to date! No new vessels to scrape.")
@@ -228,6 +237,20 @@ def main():
         log_data['photos_downloaded'] = stats.get('total_photos', 0)  # Actually uploaded to GCS
         log_data['failed_vessels'] = stats.get('failed_vessels', 0)
         
+        # ============ STEP 4: Update IMO Gallery JSON ============
+        if log_data['new_vessels_scraped'] > 0:
+            print_header("STEP 4: UPDATING IMO GALLERY JSON", "-", 70)
+            print("📝 Updating IMO gallery JSON with new vessels...")
+            
+            try:
+                gcs.update_imo_gallery_json()
+                print("✅ IMO gallery JSON successfully updated")
+                log_data['gallery_json_updated'] = True
+            except Exception as e:
+                print(f"⚠️  Failed to update IMO gallery JSON: {e}")
+                log_data['gallery_json_updated'] = False
+                log_data['gallery_json_error'] = str(e)
+        
         # ============ COMPLETION ============
         log_data['total_time'] = time.time() - start_time
         log_data['status'] = 'completed'
@@ -240,8 +263,11 @@ def main():
         
         # Success message
         if log_data['photos_downloaded'] > 0:
-            print("\n🎉 SUCCESS! Images have been uploaded to Google Cloud Storage.")
-            print(f"☁️  Location: gs://{CONFIG['gcs']['bucket_name']}/{CONFIG['gcs']['paths']['upload_base']}/{datetime.now().strftime('%Y-%m-%d')}/")
+            print("\n🎉 SUCCESS! Images and metadata have been uploaded to Google Cloud Storage.")
+            print(f"📸 Photos: gs://{CONFIG['gcs']['bucket_name']}/reidentification/bronze/raw_crops/ship_spotting/IMO_*/")
+            print(f"📄 JSONs: gs://{CONFIG['gcs']['bucket_name']}/reidentification/bronze/json_lables/ship_spotting/IMO_*/")
+            if log_data.get('gallery_json_updated'):
+                print("📋 IMO gallery index has been updated with new vessels")
         else:
             print("\n⚠️  Completed, but no photos were uploaded.")
             print("   This might be due to vessels not having photos on ShipSpotting.")

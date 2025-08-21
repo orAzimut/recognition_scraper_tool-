@@ -2,6 +2,7 @@
 """
 gcs_helper.py
 Google Cloud Storage helper functions for the vessel scraping project
+Optimized version using JSON file for fast IMO lookups
 """
 
 import os
@@ -46,6 +47,17 @@ class GCSManager:
         # Initialize GCS client
         self._init_gcs_client()
         
+        # JSON file path for IMO gallery
+        self.imo_json_path = "reidentification/bronze/json_lables/ship_spotting/imo_galley.json"
+        
+        # Separate paths for photos and JSONs
+        self.photo_base = "reidentification/bronze/raw_crops/ship_spotting"
+        self.json_base = "reidentification/bronze/json_lables/ship_spotting"
+        
+        # Cache for IMO list
+        self._cached_imos = None
+        self._new_imos_this_session = set()
+        
     def _init_gcs_client(self):
         """Initialize Google Cloud Storage client"""
         credentials_path = self.config['gcs']['credentials_path']
@@ -61,76 +73,115 @@ class GCSManager:
         self.bucket_name = self.config['gcs']['bucket_name']
         self.bucket = self.client.bucket(self.bucket_name)
         
-        # Set paths from config
-        self.upload_base = self.config['gcs']['paths']['upload_base']
-        self.check_base = self.config['gcs']['paths']['check_base']
+        # Set paths - ignoring config paths, using hardcoded values
+        self.upload_base = "reidentification/bronze/raw_crops/ship_spotting"  # For photos
+        self.check_base = self.upload_base  # Check in the photo location
         
         logger.info(f"✅ GCS client initialized for bucket: {self.bucket_name}")
     
-    def check_existing_imos(self) -> Set[str]:
-        """Check for existing IMO folders in GCS"""
-        existing_imos = set()
-        
-        # Pattern to match IMO folders (IMO_1234567 or just 1234567)
-        imo_pattern = re.compile(r"(?:IMO[_\-\s]*)(\d{7})", re.I)
-        
+    def _load_imo_json(self) -> Set[str]:
+        """Load the IMO gallery JSON file from GCS"""
         try:
-            # List all blobs under the check_base path
-            prefix = self.check_base.rstrip('/') + '/'
-            blobs = self.client.list_blobs(self.bucket_name, prefix=prefix)
+            blob = self.bucket.blob(self.imo_json_path)
             
-            # Track processed paths to avoid duplicates
-            processed_paths = set()
+            if not blob.exists():
+                logger.warning(f"IMO gallery JSON not found at {self.imo_json_path}, creating new one")
+                return set()
             
-            for blob in blobs:
-                # Extract directory paths from blob names
-                parts = blob.name.split('/')
-                
-                # Check each directory level for IMO patterns
-                for i in range(len(parts) - 1):  # -1 to exclude the file name
-                    dir_path = '/'.join(parts[:i+1])
-                    
-                    if dir_path in processed_paths:
-                        continue
-                    processed_paths.add(dir_path)
-                    
-                    dir_name = parts[i]
-                    
-                    # Check if directory name matches IMO pattern
-                    match = imo_pattern.search(dir_name)
-                    if match:
-                        existing_imos.add(match.group(1))
-                    elif re.fullmatch(r"\d{7}", dir_name):
-                        existing_imos.add(dir_name)
+            # Download and parse JSON
+            json_content = blob.download_as_text()
+            data = json.loads(json_content)
             
-            logger.info(f"📊 Found {len(existing_imos)} existing IMOs in GCS")
+            # Handle different possible JSON structures
+            if isinstance(data, list):
+                # If it's a simple list of IMOs
+                imos = set(str(imo) for imo in data if str(imo).isdigit() and len(str(imo)) == 7)
+            elif isinstance(data, dict):
+                # Check for our expected structure first
+                if "imos" in data and isinstance(data["imos"], list):
+                    # This is our expected structure
+                    imos = set(str(imo) for imo in data["imos"] if str(imo).isdigit() and len(str(imo)) == 7)
+                elif "imo_numbers" in data and isinstance(data["imo_numbers"], list):
+                    # Alternative structure with imo_numbers key
+                    imos = set(str(imo) for imo in data["imo_numbers"] if str(imo).isdigit() and len(str(imo)) == 7)
+                else:
+                    # Legacy structure - might have IMOs as keys
+                    # Only take keys that look like IMO numbers (7 digits)
+                    imos = set()
+                    for key in data.keys():
+                        if str(key).isdigit() and len(str(key)) == 7:
+                            imos.add(str(key))
+            else:
+                logger.warning(f"Unexpected JSON structure in IMO gallery file")
+                imos = set()
+            
+            # Validate IMO format (should be 7 digits)
+            valid_imos = {imo for imo in imos if imo.isdigit() and len(imo) == 7}
+            
+            logger.info(f"📊 Loaded {len(valid_imos)} existing IMOs from JSON gallery")
+            return valid_imos
             
         except Exception as e:
-            logger.error(f"Error checking existing IMOs in GCS: {e}")
-            raise
+            logger.error(f"Error loading IMO gallery JSON: {e}")
+            # Fall back to empty set if there's an error
+            return set()
+    
+    def _save_imo_json(self, imos: Set[str]):
+        """Save the updated IMO list back to GCS"""
+        try:
+            # Filter to ensure we only save valid IMO numbers (7 digits)
+            valid_imos = {imo for imo in imos if str(imo).isdigit() and len(str(imo)) == 7}
+            
+            # Convert set to sorted list for consistent JSON output
+            imo_list = sorted(list(valid_imos))
+            
+            # Create JSON structure matching existing format
+            # Using "imo_numbers" to match your existing structure
+            data = {
+                "last_updated": datetime.now().isoformat(),
+                "imo_numbers": imo_list
+            }
+            
+            # Upload to GCS
+            blob = self.bucket.blob(self.imo_json_path)
+            blob.upload_from_string(
+                json.dumps(data, indent=2),
+                content_type='application/json'
+            )
+            
+            logger.info(f"✅ Updated IMO gallery JSON with {len(imo_list)} IMOs")
+            
+        except Exception as e:
+            logger.error(f"Error saving IMO gallery JSON: {e}")
+    
+    def check_existing_imos(self) -> Set[str]:
+        """Check for existing IMO folders using the JSON file for fast lookup"""
+        # Use cached IMOs if available, otherwise load from JSON
+        if self._cached_imos is None:
+            self._cached_imos = self._load_imo_json()
         
-        return existing_imos
+        return self._cached_imos.copy()
     
     def upload_image(self, imo: str, photo_id: str, image_data: bytes, 
                      metadata: Dict = None) -> bool:
-        """Upload a single image to GCS"""
+        """Upload image and metadata to separate GCS locations"""
         try:
-            # Construct the blob path
-            date_folder = datetime.now().strftime("%Y-%m-%d")
-            image_path = f"{self.upload_base}/{date_folder}/IMO_{imo}/{photo_id}.jpg"
-            
-            # Upload image
+            # Upload image to raw_crops path
+            image_path = f"{self.photo_base}/IMO_{imo}/{photo_id}.jpg"
             blob = self.bucket.blob(image_path)
             blob.upload_from_string(image_data, content_type='image/jpeg')
             
-            # Upload metadata if provided
+            # Upload metadata JSON to json_lables path
             if metadata:
-                metadata_path = f"{self.upload_base}/{date_folder}/IMO_{imo}/{photo_id}.json"
+                metadata_path = f"{self.json_base}/IMO_{imo}/{photo_id}.json"
                 metadata_blob = self.bucket.blob(metadata_path)
                 metadata_blob.upload_from_string(
                     json.dumps(metadata, indent=2),
                     content_type='application/json'
                 )
+            
+            # Track this IMO as newly added
+            self._new_imos_this_session.add(imo)
             
             return True
             
@@ -140,7 +191,8 @@ class GCSManager:
     
     def upload_batch(self, imo: str, images: List[Tuple[str, bytes, Dict]]) -> int:
         """
-        Upload multiple images for an IMO
+        Upload multiple images and JSONs to separate GCS locations
+        Photos go to raw_crops path, JSONs go to json_lables path
         
         Args:
             imo: IMO number
@@ -150,19 +202,17 @@ class GCSManager:
             Number of successfully uploaded images
         """
         uploaded = 0
-        date_folder = datetime.now().strftime("%Y-%m-%d")
-        base_path = f"{self.upload_base}/{date_folder}/IMO_{imo}"
         
         for photo_id, image_data, metadata in images:
             try:
-                # Upload image
-                image_path = f"{base_path}/{photo_id}.jpg"
+                # Upload image to raw_crops path
+                image_path = f"{self.photo_base}/IMO_{imo}/{photo_id}.jpg"
                 image_blob = self.bucket.blob(image_path)
                 image_blob.upload_from_string(image_data, content_type='image/jpeg')
                 
-                # Upload metadata
+                # Upload metadata JSON to json_lables path
                 if metadata:
-                    metadata_path = f"{base_path}/{photo_id}.json"
+                    metadata_path = f"{self.json_base}/IMO_{imo}/{photo_id}.json"
                     metadata_blob = self.bucket.blob(metadata_path)
                     metadata_blob.upload_from_string(
                         json.dumps(metadata, indent=2),
@@ -174,58 +224,114 @@ class GCSManager:
             except Exception as e:
                 logger.error(f"Error uploading {photo_id} for IMO {imo}: {e}")
         
+        # Track this IMO as newly added
+        if uploaded > 0:
+            self._new_imos_this_session.add(imo)
+        
         return uploaded
     
-    def create_imo_folder(self, imo: str) -> str:
+    def rebuild_imo_gallery_json(self) -> Set[str]:
         """
-        Create a folder structure for an IMO (by creating a placeholder)
-        Returns the folder path
+        Rebuild the IMO gallery JSON by scanning existing folders in GCS.
+        Useful for recovering from corrupted JSON or initial setup.
         """
-        date_folder = datetime.now().strftime("%Y-%m-%d")
-        folder_path = f"{self.upload_base}/{date_folder}/IMO_{imo}/"
+        logger.info("🔄 Rebuilding IMO gallery JSON from existing GCS folders...")
         
-        # Create a placeholder file to establish the folder
-        placeholder_blob = self.bucket.blob(f"{folder_path}.placeholder")
-        placeholder_blob.upload_from_string(
-            f"Folder created for IMO {imo} on {datetime.now().isoformat()}"
-        )
+        existing_imos = set()
         
-        return folder_path
+        # Pattern to match IMO folders (IMO_1234567 or just 1234567)
+        imo_pattern = re.compile(r"(?:IMO[_\-\s]*)(\d{7})", re.I)
+        
+        try:
+            # Scan the photo storage path for IMO folders
+            prefix = self.photo_base.rstrip('/') + '/'
+            blobs = self.client.list_blobs(self.bucket_name, prefix=prefix, delimiter='/')
+            
+            # Get folder names (prefixes)
+            for prefix in blobs.prefixes:
+                # Extract folder name from path
+                folder_name = prefix.rstrip('/').split('/')[-1]
+                
+                # Check if folder name matches IMO pattern
+                match = imo_pattern.search(folder_name)
+                if match:
+                    imo = match.group(1)
+                    if imo.isdigit() and len(imo) == 7:
+                        existing_imos.add(imo)
+                elif folder_name.isdigit() and len(folder_name) == 7:
+                    existing_imos.add(folder_name)
+            
+            logger.info(f"📊 Found {len(existing_imos)} IMO folders in GCS")
+            
+            # Save the rebuilt list
+            if existing_imos:
+                self._save_imo_json(existing_imos)
+                self._cached_imos = existing_imos
+                logger.info(f"✅ Rebuilt IMO gallery JSON with {len(existing_imos)} IMOs")
+            else:
+                logger.warning("No IMO folders found in GCS")
+                
+        except Exception as e:
+            logger.error(f"Error rebuilding IMO gallery JSON: {e}")
+            raise
+        
+        return existing_imos
     
     def check_imo_exists(self, imo: str) -> bool:
-        """Check if a specific IMO exists in GCS"""
-        prefix = f"{self.check_base}/"
+        """Check if a specific IMO exists using the JSON cache"""
+        if self._cached_imos is None:
+            self._cached_imos = self._load_imo_json()
         
-        # Look for any blob that contains this IMO in its path
-        blobs = self.client.list_blobs(
-            self.bucket_name, 
-            prefix=prefix,
-            max_results=1000  # Limit for performance
-        )
-        
-        imo_pattern = re.compile(rf"(?:IMO[_\-\s]*)?{imo}(?:[/\.]|$)", re.I)
-        
-        for blob in blobs:
-            if imo_pattern.search(blob.name):
-                return True
-        
-        return False
+        return imo in self._cached_imos
     
     def get_imo_image_count(self, imo: str) -> int:
         """Get the number of images for a specific IMO"""
         count = 0
-        prefix = f"{self.check_base}/"
-        
-        # Pattern to match this specific IMO
-        imo_pattern = re.compile(rf"IMO[_\-\s]*{imo}/.*\.jpg$", re.I)
+        prefix = f"{self.photo_base}/IMO_{imo}/"
         
         blobs = self.client.list_blobs(self.bucket_name, prefix=prefix)
         
         for blob in blobs:
-            if imo_pattern.search(blob.name):
+            if blob.name.endswith('.jpg'):
                 count += 1
         
         return count
+    
+    def update_imo_gallery_json(self):
+        """Update the IMO gallery JSON with newly scraped IMOs"""
+        if not self._new_imos_this_session:
+            logger.info("No new IMOs to add to gallery JSON")
+            return
+        
+        # Load current IMOs (force reload to get latest)
+        try:
+            # Force reload from GCS to ensure we have the latest data
+            current_imos = self._load_imo_json()
+        except Exception as e:
+            logger.error(f"Error loading current IMO gallery: {e}")
+            current_imos = set()
+        
+        # Filter valid IMOs from new session
+        valid_new_imos = {imo for imo in self._new_imos_this_session 
+                          if str(imo).isdigit() and len(str(imo)) == 7}
+        
+        # Add new IMOs
+        initial_count = len(current_imos)
+        updated_imos = current_imos.union(valid_new_imos)
+        
+        # Save updated list
+        self._save_imo_json(updated_imos)
+        
+        added_count = len(updated_imos) - initial_count
+        logger.info(f"📝 Added {added_count} new IMOs to gallery JSON")
+        logger.info(f"   New IMOs: {sorted(valid_new_imos)}")
+        logger.info(f"   Total IMOs in gallery: {len(updated_imos)}")
+        
+        # Update cache
+        self._cached_imos = updated_imos
+        
+        # Clear the session tracking
+        self._new_imos_this_session.clear()
     
     def test_connection(self) -> bool:
         """Test the GCS connection"""
@@ -237,6 +343,10 @@ class GCSManager:
             # Check if our bucket exists
             if self.bucket.exists():
                 logger.info(f"✅ Bucket '{self.bucket_name}' is accessible")
+                
+                # Test loading the IMO JSON
+                self._cached_imos = self._load_imo_json()
+                
                 return True
             else:
                 logger.error(f"❌ Bucket '{self.bucket_name}' not found or not accessible")

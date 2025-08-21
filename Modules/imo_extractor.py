@@ -74,18 +74,13 @@ PORT_LON = CONFIG['port']['longitude']
 
 # 5 sample IMOs for hardcoded testing (valid 7-digit format; arbitrary values)
 HARD_CODED_IMOS: List[str] = [
-    "9387421",
-    "9734567",
-    "9123456",
-    "9701234",
-    "9876543",
+
+    
+    "9401099",
 ]
 HARD_CODED_DETAILS: Dict[str, Dict] = {
-    "9387421": {"name": "TEST VESSEL A", "vessel_type": "Container", "mmsi": "", "lat": 0, "lon": 0, "destination": "", "speed": 0, "course": 0, "timestamp": "", "extracted_at": ""},
-    "9734567": {"name": "TEST VESSEL B", "vessel_type": "Tanker",    "mmsi": "", "lat": 0, "lon": 0, "destination": "", "speed": 0, "course": 0, "timestamp": "", "extracted_at": ""},
-    "9123456": {"name": "TEST VESSEL C", "vessel_type": "Bulk",      "mmsi": "", "lat": 0, "lon": 0, "destination": "", "speed": 0, "course": 0, "timestamp": "", "extracted_at": ""},
-    "9701234": {"name": "TEST VESSEL D", "vessel_type": "General",   "mmsi": "", "lat": 0, "lon": 0, "destination": "", "speed": 0, "course": 0, "timestamp": "", "extracted_at": ""},
-    "9876543": {"name": "TEST VESSEL E", "vessel_type": "Ro-Ro",     "mmsi": "", "lat": 0, "lon": 0, "destination": "", "speed": 0, "course": 0, "timestamp": "", "extracted_at": ""},
+ 
+    "9401099": {"name": "TEST VESSEL E", "vessel_type": "Ro-Ro",     "mmsi": "", "lat": 0, "lon": 0, "destination": "", "speed": 0, "course": 0, "timestamp": "", "extracted_at": ""},
 }
 
 # ====================== Haifa Bay Tracker ======================

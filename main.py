@@ -8,6 +8,7 @@ Now uses Google Cloud Storage with JSON-based IMO gallery tracking
 import time
 import sys
 import yaml
+import json
 from pathlib import Path
 from datetime import datetime
 from typing import Dict
@@ -117,6 +118,60 @@ def main():
         log_data['gallery_check_time'] = time.time() - gallery_check_start
         log_data['existing_vessels'] = len(existing_imos)
         log_data['new_vessels_to_scrape'] = len(missing_imos)
+        
+        # Print IMO summary
+        print(f"\n📊 IMO Summary:")
+        print(f"  • Total vessels in area: {len(haifa_imos)}")
+        print(f"  • Already in gallery: {len(existing_imos)}")
+        print(f"  • New to scrape: {len(missing_imos)}")
+        
+        # Create and save IMO JSON file
+        imo_data = {
+            "total_vessels_in_area": len(haifa_imos),
+            "existing_imos_in_gallery": existing_imos,
+            "missing_imos_to_download": missing_imos,
+            "timestamp": datetime.now().isoformat()
+        }
+        
+        # Try multiple output locations in case of path issues
+        output_locations = [
+            Path("output_json"),  # Current directory (works in both local and Docker)
+            Path("/app/output_json"),  # Docker app directory
+            Path("/tmp/output_json"),  # Docker temp directory
+        ]
+        
+        output_file = None
+        for output_dir in output_locations:
+            try:
+                output_dir.mkdir(parents=True, exist_ok=True)
+                output_file = output_dir / f"imo_status_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+                
+                with open(output_file, 'w', encoding='utf-8') as f:
+                    json.dump(imo_data, f, indent=2, ensure_ascii=False)
+                
+                print(f"\n💾 IMO status saved to: {output_file}")
+                break  # Successfully saved, exit loop
+                
+            except Exception as e:
+                print(f"⚠️  Failed to save to {output_dir}: {e}")
+                continue
+        
+        if output_file is None:
+            print("❌ Failed to save IMO JSON file to any location!")
+        else:
+            # Verify the file was actually created
+            if output_file.exists():
+                file_size = output_file.stat().st_size
+                print(f"✅ File verified: {file_size} bytes")
+            else:
+                print("❌ File was not created!")
+        
+        # Print JSON output for existing and missing IMOs
+        print(f"\n📋 Existing IMOs in gallery:")
+        print(json.dumps(existing_imos, indent=2))
+        
+        print(f"\n🆕 Missing IMOs to download:")
+        print(json.dumps(missing_imos, indent=2))
         
         if not missing_imos:
             print("\n🎉 Gallery is up to date! No new vessels to scrape.")

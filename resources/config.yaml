@@ -22,7 +22,7 @@ port:
   name: "Haifa Bay"
   latitude: 32.8154
   longitude: 35.0043
-  search_radius_km: 15
+  search_radius_km: 8
 
 # Scraping Configuration - CONSERVATIVE FOR RELIABILITY
 scraping:

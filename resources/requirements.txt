@@ -1,0 +1,17 @@
+# HTTP and Web Scraping
+requests>=2.31.0
+httpx>=0.27.0
+cloudscraper>=1.2.71
+beautifulsoup4>=4.12.0
+
+# Google Cloud Services
+google-cloud-storage>=2.10.0
+google-auth>=2.23.0
+
+# Configuration and Data Processing
+PyYAML>=6.0.1
+
+# Optional: For better logging and development
+colorlog>=6.7.0
+lxml
+httpx[http2]

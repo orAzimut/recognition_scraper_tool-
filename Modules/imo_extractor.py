@@ -76,11 +76,13 @@ PORT_LON = CONFIG['port']['longitude']
 HARD_CODED_IMOS: List[str] = [
 
     
-    "9401099",
+    "9847231","9477505"
 ]
 HARD_CODED_DETAILS: Dict[str, Dict] = {
  
-    "9401099": {"name": "TEST VESSEL E", "vessel_type": "Ro-Ro",     "mmsi": "", "lat": 0, "lon": 0, "destination": "", "speed": 0, "course": 0, "timestamp": "", "extracted_at": ""},
+    "9847231": {"name": "TEST VESSEL E", "vessel_type": "Ro-Ro",     "mmsi": "", "lat": 0, "lon": 0, "destination": "", "speed": 0, "course": 0, "timestamp": "", "extracted_at": ""},
+        "9477505": {"name": "TEST VESSEL E", "vessel_type": "Ro-Ro",     "mmsi": "", "lat": 0, "lon": 0, "destination": "", "speed": 0, "course": 0, "timestamp": "", "extracted_at": ""},
+
 }
 
 # ====================== Haifa Bay Tracker ======================
@@ -148,9 +150,7 @@ class GCSGalleryChecker:
         
     def check_existing_imos(self) -> Set[str]:
         """Check GCS for existing IMOs"""
-        log.info("🔍 Checking existing IMOs in Google Cloud Storage...")
         existing_imos = self.gcs_manager.check_existing_imos()
-        log.info(f"📂 Found {len(existing_imos)} IMOs in GCS gallery")
         return existing_imos
 
 # ====================== Mode Selection ======================
@@ -214,7 +214,7 @@ def extract_haifa_imos(mode: Optional[str] = None) -> Tuple[List[str], Dict[str,
 
 def find_missing_imos(haifa_imos: List[str]) -> Tuple[List[str], List[str]]:
     """Find missing IMOs by checking GCS instead of local gallery"""
-    log.info("🔍 Checking existing gallery in Google Cloud Storage...")
+    log.info("🔍 Checking existing gallery...")
     
     # Use GCS checker instead of local
     checker = GCSGalleryChecker()
@@ -223,7 +223,7 @@ def find_missing_imos(haifa_imos: List[str]) -> Tuple[List[str], List[str]]:
     missing_imos = [imo for imo in haifa_imos if imo not in existing_imos]
     existing_in_gallery = [imo for imo in haifa_imos if imo in existing_imos]
 
-    log.info("🆕 %d new IMOs to scrape | ✅ %d already in gallery.", len(missing_imos), len(existing_in_gallery))
+    log.info("📊 IMOs found: %d | Missing: %d", len(existing_in_gallery), len(missing_imos))
     return missing_imos, existing_in_gallery
 
 # For backward compatibility - keep the old signature but ignore gallery_dir

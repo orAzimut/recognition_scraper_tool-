@@ -92,6 +92,12 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Set specific loggers to WARNING to reduce HTTP debug noise
+logging.getLogger('httpx').setLevel(logging.WARNING)
+logging.getLogger('urllib3').setLevel(logging.WARNING)
+logging.getLogger('requests').setLevel(logging.WARNING)
+logging.getLogger('cloudscraper').setLevel(logging.WARNING)
+
 # ====================== Data Classes ======================
 @dataclass
 class ScrapeResult:
@@ -116,7 +122,6 @@ class CloudscraperSession:
     
     def _initialize(self):
         """Initialize the cloudscraper session"""
-        logger.info("Initializing Cloudflare bypass...")
         self.session = cloudscraper.create_scraper()
         
         # Warm up the session
@@ -129,11 +134,10 @@ class CloudscraperSession:
             test_response = self.session.get(test_url, timeout=15)
             
             if test_response.status_code == 403:
-                logger.warning("Initial 403 - retrying with new session")
                 self.session = cloudscraper.create_scraper(browser='chrome')
                 test_response = self.session.get(test_url, timeout=15)
                 
-            logger.info(f"✅ Cloudflare bypass successful (status: {test_response.status_code})")
+            logger.info(f"✅ Cloudflare bypass successful")
             
         except Exception as e:
             logger.error(f"Failed to initialize Cloudflare bypass: {e}")
@@ -152,12 +156,10 @@ class CloudscraperSession:
                     
                     if response.status_code == 429:  # Rate limited
                         backoff = RETRY_BACKOFF_BASE * (2 ** attempt) + random.uniform(0, 1)
-                        logger.warning(f"Rate limited, backing off {backoff:.1f}s")
                         time.sleep(backoff)
                         continue
                     
                     if response.status_code == 403:  # Cloudflare challenge
-                        logger.warning(f"Got 403 on attempt {attempt + 1}, reinitializing session")
                         with self.lock:
                             self._initialize()
                         continue
@@ -172,7 +174,6 @@ class CloudscraperSession:
                 except Exception as e:
                     if attempt < MAX_RETRIES - 1:
                         backoff = RETRY_BACKOFF_BASE * (2 ** attempt)
-                        logger.debug(f"Request failed: {e}, retrying in {backoff:.1f}s")
                         time.sleep(backoff)
                     else:
                         logger.error(f"Failed after {MAX_RETRIES} attempts: {url}")
@@ -264,15 +265,10 @@ class PhotoFinder:
         page1_ids = self.extract_photo_ids(html)
         all_photo_ids.update(page1_ids)
         
-        # Log the detected count
-        if total_photos > 0:
-            logger.info(f"📊 Found {total_photos} total photos for IMO {imo}")
-        
         # CRITICAL FIX: Always fetch multiple pages if we got a full first page
         if len(page1_ids) >= 12:  # ShipSpotting shows 12 per page
             if total_photos <= 0:
                 # Can't detect total, but got full page - assume at least 5 pages worth
-                logger.info(f"Got {len(page1_ids)} photos on page 1, assuming more pages exist")
                 estimated_pages = min(max_pages, 5)
             else:
                 # We know the total, calculate pages needed
@@ -291,16 +287,12 @@ class PhotoFinder:
         if pages_needed <= 1:
             return all_photo_ids, total_photos if total_photos > 0 else len(all_photo_ids)
         
-        logger.info(f"📄 Will fetch {pages_needed} pages to get photos")
-        
         # Fetch remaining pages in parallel using threads - FAST!
         def fetch_page(page_num):
             url = self.get_gallery_url(imo, sort_by, page_num)
             response = self.session.get(url)
             if response and response.status_code == 200:
                 ids = self.extract_photo_ids(response.text)
-                if len(ids) > 0:
-                    logger.debug(f"Page {page_num}: found {len(ids)} photos")
                 return ids
             return set()
         
@@ -326,8 +318,6 @@ class PhotoFinder:
         all_photo_ids = set()
         total_photos = -1
         
-        logger.info(f"🔍 Searching for IMO {imo}...")
-        
         # Primary search: newest photos - this usually gets everything
         photo_ids, total_photos = self.search_gallery_pages_parallel(
             imo, "newest", MAX_GALLERY_PAGES, MAX_PHOTOS_PER_IMO
@@ -335,14 +325,12 @@ class PhotoFinder:
         all_photo_ids.update(photo_ids)
         
         if total_photos == 0:
-            logger.info(f"No photos found for IMO {imo}")
             return [], 0
         
         # Check if we got everything we expected
         if total_photos > 0 and len(all_photo_ids) < min(total_photos, MAX_PHOTOS_PER_IMO):
             # We're missing some photos, try other sort orders
             missing_count = min(total_photos, MAX_PHOTOS_PER_IMO) - len(all_photo_ids)
-            logger.info(f"📝 Missing {missing_count} photos, trying other sort orders...")
             
             for sort_order in ['oldest', 'popular']:
                 # Just fetch a couple pages of each sort to find unique photos
@@ -352,7 +340,6 @@ class PhotoFinder:
                 
                 new_ids = extra_ids - all_photo_ids
                 if new_ids:
-                    logger.debug(f"Sort '{sort_order}' found {len(new_ids)} new photos")
                     all_photo_ids.update(new_ids)
                     
                     # Stop if we have enough
@@ -362,11 +349,8 @@ class PhotoFinder:
         # Prepare final list
         photo_list = list(all_photo_ids)[:MAX_PHOTOS_PER_IMO]
         
-        # Final log
-        if total_photos > 0:
-            logger.info(f"📷 Collected {len(photo_list)}/{total_photos} photo IDs for IMO {imo}")
-        else:
-            logger.info(f"📷 Collected {len(photo_list)} photo IDs for IMO {imo}")
+        # Show only the final result
+        logger.info(f"IMO {imo} found {len(photo_list)} images")
         
         return photo_list, total_photos if total_photos > 0 else len(photo_list)
 
@@ -461,10 +445,6 @@ class GCSImageUploader:
                 if result:
                     uploaded += 1
                 
-                # Progress update
-                if i % 10 == 0 or i == len(tasks):
-                    logger.info(f"  Progress: {i}/{len(tasks)} images processed, {uploaded} uploaded to GCS")
-            
             return uploaded
 
 # ====================== Main Scraper ======================
@@ -492,17 +472,15 @@ class ShipSpottingScraper:
                 time_taken=time.time() - start_time
             )
         
-        logger.info(f"☁️  Uploading {len(photo_ids)} images to GCS for {vessel_name[:30]}...")
-        
         # Download and upload images to GCS
         uploaded = await self.uploader.upload_batch(imo, photo_ids)
         
         elapsed = time.time() - start_time
         
         if uploaded > 0:
-            logger.info(f"✅ IMO {imo}: {uploaded}/{len(photo_ids)} images uploaded to GCS in {elapsed:.1f}s")
+            logger.info(f"IMO {imo} downloaded {uploaded} frames")
         else:
-            logger.warning(f"⚠️ IMO {imo}: No images uploaded to GCS")
+            logger.warning(f"IMO {imo}: No images uploaded")
         
         return ScrapeResult(
             imo=imo,
@@ -541,9 +519,9 @@ class BatchProcessor:
         # Run all tasks concurrently
         results = await asyncio.gather(*tasks, return_exceptions=True)
         
-        # Filter out exceptions
+        # Filter out exceptions and track progress
         valid_results = []
-        for result in results:
+        for i, result in enumerate(results):
             if isinstance(result, Exception):
                 logger.error(f"Error processing IMO: {result}")
                 self.stats['failed_vessels'] += 1
@@ -552,7 +530,7 @@ class BatchProcessor:
                 self.stats['total_photos'] += result.downloaded
                 if result.downloaded == 0:
                     self.stats['failed_vessels'] += 1
-        
+                
         return valid_results
     
     def process_imos(self, imo_list: List[str], vessel_details: Dict[str, Dict]) -> Dict:
@@ -561,11 +539,6 @@ class BatchProcessor:
             return self.stats
         
         start_time = time.time()
-        
-        logger.info(f"\n🚀 Processing {len(imo_list)} IMOs with GCS upload")
-        logger.info(f"☁️  Target: Google Cloud Storage - {CONFIG['gcs']['bucket_name']}")
-        logger.info(f"📸 Fetching up to {MAX_PHOTOS_PER_IMO} photos per vessel")
-        logger.info(f"⚡ Gallery workers: {GALLERY_WORKERS}, Image downloads: {IMAGE_DOWNLOAD_WORKERS}")
         
         self.stats['total_vessels'] = len(imo_list)
         
@@ -589,11 +562,6 @@ class BatchProcessor:
             batch_end = min(batch_start + BATCH_SIZE, len(imo_list))
             batch_imos = imo_list[batch_start:batch_end]
             
-            batch_num = (batch_start // BATCH_SIZE) + 1
-            total_batches = (len(imo_list) + BATCH_SIZE - 1) // BATCH_SIZE
-            
-            logger.info(f"\n📦 Batch {batch_num}/{total_batches} ({len(batch_imos)} IMOs)")
-            
             # Prepare batch data
             batch_data = [
                 (imo, vessel_details.get(imo, {}).get('name', 'Unknown'))
@@ -609,22 +577,12 @@ class BatchProcessor:
         
         # Print summary
         logger.info("\n" + "="*60)
-        logger.info("📊 SCRAPING COMPLETE - SUMMARY")
+        logger.info("FINAL SUMMARY")
         logger.info("="*60)
-        logger.info(f"Total vessels processed: {self.stats['total_vessels']}")
-        logger.info(f"Total images uploaded to GCS: {self.stats['total_photos']}")
-        logger.info(f"Failed vessels: {self.stats['failed_vessels']}")
-        logger.info(f"⏱️  Total time: {self.stats['total_time']:.1f}s")
-        logger.info(f"☁️  Storage: gs://{CONFIG['gcs']['bucket_name']}/{CONFIG['gcs']['paths']['upload_base']}")
-    
-        
-        if all_results:
-            avg_time = sum(r.time_taken for r in all_results) / len(all_results)
-            logger.info(f"⚡ Average time per vessel: {avg_time:.1f}s")
-            
-            if self.stats['total_photos'] > 0:
-                imgs_per_sec = self.stats['total_photos'] / self.stats['total_time']
-                logger.info(f"🚀 Upload rate: {imgs_per_sec:.1f} images/second")
+        logger.info(f"Total vessels: {self.stats['total_vessels']}")
+        logger.info(f"Total images: {self.stats['total_photos']}")
+        logger.info(f"Failed: {self.stats['failed_vessels']}")
+        logger.info(f"Total time: {self.stats['total_time']:.1f}s")
         
         return self.stats
 
@@ -636,12 +594,7 @@ def scrape_missing_imos(missing_imos: List[str], vessel_details: Dict[str, Dict]
     Note: gallery_dir parameter is kept for backward compatibility but ignored
     """
     if not missing_imos:
-        logger.info("✅ No IMOs to scrape - gallery is up to date!")
         return {'total_vessels': 0, 'total_photos': 0}
-    
-    # Log that we're using GCS
-    logger.info(f"☁️  Using Google Cloud Storage for uploads")
-    logger.info(f"📂 Upload path: gs://{CONFIG['gcs']['bucket_name']}/{CONFIG['gcs']['paths']['upload_base']}")
     
     # Process all IMOs
     processor = BatchProcessor()
@@ -654,9 +607,9 @@ if __name__ == "__main__":
     # Test the module
     print("Testing Enhanced ShipSpotting Scraper with GCS...")
     
-    test_imos = ["9169031", "9289972"]
+    test_imos = ["9728239", "9289972"]
     test_details = {
-        "9169031": {"name": "Test Vessel 1"},
+        "9728239": {"name": "Test Vessel 1"},
         "9289972": {"name": "Test Vessel 2"}
     }
     

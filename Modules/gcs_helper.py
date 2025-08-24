@@ -77,7 +77,7 @@ class GCSManager:
         self.upload_base = "reidentification/bronze/raw_crops/ship_spotting"  # For photos
         self.check_base = self.upload_base  # Check in the photo location
         
-        logger.info(f"✅ GCS client initialized for bucket: {self.bucket_name}")
+        # GCS client initialized silently
     
     def _load_imo_json(self) -> Set[str]:
         """Load the IMO gallery JSON file from GCS"""
@@ -118,7 +118,7 @@ class GCSManager:
             # Validate IMO format (should be 7 digits)
             valid_imos = {imo for imo in imos if imo.isdigit() and len(imo) == 7}
             
-            logger.info(f"📊 Loaded {len(valid_imos)} existing IMOs from JSON gallery")
+            # Loaded IMOs silently
             return valid_imos
             
         except Exception as e:
@@ -149,7 +149,7 @@ class GCSManager:
                 content_type='application/json'
             )
             
-            logger.info(f"✅ Updated IMO gallery JSON with {len(imo_list)} IMOs")
+            # Updated IMO gallery JSON silently
             
         except Exception as e:
             logger.error(f"Error saving IMO gallery JSON: {e}")
@@ -235,7 +235,7 @@ class GCSManager:
         Rebuild the IMO gallery JSON by scanning existing folders in GCS.
         Useful for recovering from corrupted JSON or initial setup.
         """
-        logger.info("🔄 Rebuilding IMO gallery JSON from existing GCS folders...")
+        logger.info("🔄 Rebuilding IMO gallery JSON...")
         
         existing_imos = set()
         
@@ -261,13 +261,13 @@ class GCSManager:
                 elif folder_name.isdigit() and len(folder_name) == 7:
                     existing_imos.add(folder_name)
             
-            logger.info(f"📊 Found {len(existing_imos)} IMO folders in GCS")
+            logger.info(f"📊 Found {len(existing_imos)} IMO folders")
             
             # Save the rebuilt list
             if existing_imos:
                 self._save_imo_json(existing_imos)
                 self._cached_imos = existing_imos
-                logger.info(f"✅ Rebuilt IMO gallery JSON with {len(existing_imos)} IMOs")
+                logger.info(f"✅ Rebuilt IMO gallery JSON")
             else:
                 logger.warning("No IMO folders found in GCS")
                 
@@ -324,8 +324,7 @@ class GCSManager:
         
         added_count = len(updated_imos) - initial_count
         logger.info(f"📝 Added {added_count} new IMOs to gallery JSON")
-        logger.info(f"   New IMOs: {sorted(valid_new_imos)}")
-        logger.info(f"   Total IMOs in gallery: {len(updated_imos)}")
+        logger.info(f"📊 Total IMOs in gallery: {len(updated_imos)}")
         
         # Update cache
         self._cached_imos = updated_imos
@@ -338,18 +337,15 @@ class GCSManager:
         try:
             # Try to list buckets to verify credentials
             buckets = list(self.client.list_buckets(max_results=1))
-            logger.info(f"✅ GCS connection successful")
             
             # Check if our bucket exists
             if self.bucket.exists():
-                logger.info(f"✅ Bucket '{self.bucket_name}' is accessible")
-                
                 # Test loading the IMO JSON
                 self._cached_imos = self._load_imo_json()
                 
                 return True
             else:
-                logger.error(f"❌ Bucket '{self.bucket_name}' not found or not accessible")
+                logger.error(f"❌ Bucket not accessible")
                 return False
                 
         except Exception as e:

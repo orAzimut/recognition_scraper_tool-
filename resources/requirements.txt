@@ -15,3 +15,4 @@ PyYAML>=6.0.1
 colorlog>=6.7.0
 lxml
 httpx[http2]
+schedule>=1.2.0

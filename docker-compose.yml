@@ -1,4 +1,3 @@
-
 services:
   recognition-gallery:
     build:
@@ -7,35 +6,12 @@ services:
     image: recognition-gallery:latest
     container_name: recognition-gallery-container
     
-    # Uncomment if your app needs ports exposed
-    # ports:
-    #   - "8000:8000"
-    
-    # Environment variables (modify as needed)
     environment:
       - PYTHONUNBUFFERED=1
-      # Add any other environment variables your app needs
-      # - DATABASE_URL=your_database_url
-      # - API_KEY=your_api_key
     
-    # Volume mounts (if you need to persist data or access local files)
     volumes:
-      # Mount config file if it changes frequently
       - ./resources/config.yaml:/app/resources/config.yaml:ro
-      # Uncomment if you need to persist data
-      # - ./data:/app/data
+      # Add this line to mount output_json directory
+      - ./output_json:/app/output_json
     
-    # Restart policy
     restart: unless-stopped
-    
-    # Resource limits (optional)
-    # deploy:
-    #   resources:
-    #     limits:
-    #       cpus: '2'
-    #       memory: 2G
-    #     reservations:
-    #       cpus: '1'
-    #       memory: 1G
-    
-    
